@@ -82,13 +82,22 @@ async def build_sub_keyboard(bot: Bot) -> InlineKeyboardMarkup:
     channels = await models.get_all_channels()
     buttons = []
     for ch in channels:
-        label = ch["channel_username"] or "📢 Kanal"
+        is_zayafka = ch["channel_type"] == "join_request"
+        icon = "🔐" if is_zayafka else "📢"
+        label = f"{icon} {ch['channel_username'] or 'Kanal'}"
         buttons.append([InlineKeyboardButton(text=label, url=ch["invite_link"])])
 
     buttons.append(
         [InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")]
     )
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+FSUB_PROMPT_TEXT = (
+    "⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:\n\n"
+    "🔐 belgili kanallarga esa shu tugmani bosib 'so'rov' yuborish kifoya — "
+    "admin tasdiqlamasa ham botdan darhol foydalanishingiz mumkin."
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -109,10 +118,7 @@ async def cmd_start(message: Message, bot: Bot):
     # Force-sub check
     if not await check_force_sub(bot, user.id):
         kb = await build_sub_keyboard(bot)
-        await message.answer(
-            "⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
-            reply_markup=kb,
-        )
+        await message.answer(FSUB_PROMPT_TEXT, reply_markup=kb)
         return
 
     await message.answer(
@@ -164,10 +170,7 @@ async def handle_movie_code(message: Message, bot: Bot):
     # Force-sub check (uses Redis cache for subsequent calls)
     if not await check_force_sub(bot, user.id):
         kb = await build_sub_keyboard(bot)
-        await message.answer(
-            "⚠️ Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:",
-            reply_markup=kb,
-        )
+        await message.answer(FSUB_PROMPT_TEXT, reply_markup=kb)
         return
 
     # ── Step 1: check Redis cache ──────────────────────────────

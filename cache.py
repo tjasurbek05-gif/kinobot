@@ -135,3 +135,36 @@ async def cache_get_join_request(channel_id: int, user_id: int) -> bool:
 async def cache_clear_join_request(channel_id: int, user_id: int):
     """Remove a join-request record (e.g. after user is approved or kicked)."""
     await get_redis().delete(f"join_req:{channel_id}:{user_id}")
+
+
+# ── Pending channel cache (bot newly promoted to admin) ────────
+#
+#  When an admin adds the bot to a channel and promotes it to admin,
+#  Telegram fires a `my_chat_member` update that includes the chat AND
+#  the user who performed the action. We cache that chat under the
+#  admin's user_id so it can be offered as a one-tap "wire this up"
+#  button in "Kanal ulash" / "Zayafka kanal ulash" – the only reliable
+#  way to onboard PRIVATE channels, since the Bot API cannot resolve
+#  private invite links or @usernames for chats the bot doesn't
+#  already belong to.
+
+_PENDING_CHANNEL_TTL = 24 * 3600  # 24 hours
+
+
+async def cache_add_pending_channel(admin_id: int, chat_id: int, title: str, username: str | None):
+    """Remember a channel the bot was just made admin of by admin_id."""
+    key = f"pending_ch:{admin_id}"
+    r = get_redis()
+    await r.hset(key, str(chat_id), json.dumps({"chat_id": chat_id, "title": title, "username": username}))
+    await r.expire(key, _PENDING_CHANNEL_TTL)
+
+
+async def cache_get_pending_channels(admin_id: int) -> list[dict]:
+    """Return channels the bot was recently made admin of by admin_id."""
+    data = await get_redis().hgetall(f"pending_ch:{admin_id}")
+    return [json.loads(v) for v in data.values()]
+
+
+async def cache_remove_pending_channel(admin_id: int, chat_id: int):
+    """Drop a pending channel once it has been wired up (or rejected)."""
+    await get_redis().hdel(f"pending_ch:{admin_id}", str(chat_id))

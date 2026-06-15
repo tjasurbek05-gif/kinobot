@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import re
 import time
 from datetime import timedelta
 
@@ -14,13 +15,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message,
     CallbackQuery,
+    ChatMemberUpdated,
+    MessageOriginChannel,
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 
 import models
 import cache
@@ -39,6 +42,168 @@ def _parse_channel_input(raw: str) -> int | None:
         return int(raw)
     except ValueError:
         return None
+
+
+# Matches t.me/<...> and https://t.me/<...> links so admins can paste a
+# channel link instead of hunting for its @username or numeric ID.
+_TME_LINK_RE = re.compile(r"(?:https?://)?t\.me/(\+|joinchat/)?([\w-]+)/?$", re.IGNORECASE)
+
+
+def _extract_chat_ref(raw: str) -> tuple[str | int | None, bool]:
+    """
+    Turn admin input into something bot.get_chat() can use.
+
+    Returns (chat_ref, is_private_invite):
+      • chat_ref          – "@username", numeric chat_id, or None if unusable
+      • is_private_invite – True if `raw` is a private invite link
+                            (t.me/+xxx or t.me/joinchat/xxx), which the
+                            Bot API can never resolve directly.
+    """
+    m = _TME_LINK_RE.match(raw)
+    if m:
+        if m.group(1):  # "+xxxx" or "joinchat/xxxx"
+            return None, True
+        return f"@{m.group(2)}", False
+
+    if raw.startswith("@"):
+        return raw, False
+
+    return _parse_channel_input(raw), False
+
+
+def _truncate(text: str, limit: int = 40) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _channel_display(chat) -> str:
+    return f"@{chat.username}" if chat.username else (chat.title or str(chat.id))
+
+
+async def _resolve_target_chat(message: Message, bot: Bot):
+    """
+    Resolve a Chat object the admin wants to wire up for force-sub.
+
+    Three supported inputs, in order of reliability:
+      1. A forwarded post from the channel – works for PRIVATE channels
+         too, since Telegram includes the source chat even without an
+         @username.
+      2. @username, a t.me/<username> link, or a numeric chat_id – for
+         public channels / chats the bot already knows about.
+      3. A private invite link (t.me/+xxx) – the Bot API can never
+         resolve this, so we explain the alternatives instead.
+
+    Returns (chat, error_message). `chat` is None on failure.
+    """
+    if isinstance(message.forward_origin, MessageOriginChannel):
+        try:
+            chat = await bot.get_chat(message.forward_origin.chat.id)
+            return chat, None
+        except Exception:
+            return None, (
+                "❌ Bot bu kanalga hali a'zo emas.\n\n"
+                "Avval botni kanalga <b>admin</b> qilib qo'shing, so'ngra "
+                "shu postni qayta forward qiling."
+            )
+
+    if not message.text:
+        return None, "❌ Kanal postini forward qiling yoki @username / link yuboring."
+
+    raw = message.text.strip()
+    chat_ref, is_private_invite = _extract_chat_ref(raw)
+
+    if is_private_invite:
+        return None, (
+            "❌ Bu shaxsiy taklif havolasi — botni shu yo'l bilan ulab bo'lmaydi.\n\n"
+            "1️⃣ Botni kanalga <b>admin</b> qilib qo'shing (keyin u yuqorida "
+            "tugma sifatida chiqadi)\n"
+            "2️⃣ Yoki kanaldagi istalgan postni shu yerga <b>forward</b> qiling"
+        )
+
+    if chat_ref is None:
+        return None, "❌ Noto'g'ri format. @username, kanal linki yoki ID yuboring."
+
+    try:
+        chat = await bot.get_chat(chat_ref)
+        return chat, None
+    except Exception as e:
+        return None, (
+            f"❌ Kanal topilmadi: {e}\n\n"
+            "Bot kanalga admin qilib qo'shilganini tekshiring."
+        )
+
+
+async def _bot_admin_rights(bot: Bot, chat_id: int) -> tuple[bool, str | None]:
+    """Make sure the bot is an admin with invite-link rights in chat_id."""
+    try:
+        member = await bot.get_chat_member(chat_id, bot.id)
+    except Exception as e:
+        return False, f"❌ Bot bu kanalga kira olmadi: {e}"
+
+    if member.status not in ("administrator", "creator"):
+        return False, "❌ Bot kanalda admin emas. Botni admin qilib qo'shing."
+
+    if member.status == "administrator" and not member.can_invite_users:
+        return False, (
+            "❌ Botga admin huquqlari ichida 'Foydalanuvchilarni taklif "
+            "qilish' (Invite Users via link) ruxsatini bering."
+        )
+
+    return True, None
+
+
+async def _finalize_add_channel(bot: Bot, chat_id: int, channel_type: str) -> str:
+    """
+    Validate permissions, (re)create the invite link and persist the
+    channel. Returns a human-readable result message (✅ on success).
+    """
+    try:
+        chat = await bot.get_chat(chat_id)
+    except Exception as e:
+        return f"❌ Kanal topilmadi: {e}"
+
+    if chat.type not in ("channel", "supergroup"):
+        return "❌ Bu kanal emas. Faqat kanal yoki super-guruh qo'shish mumkin."
+
+    ok, err = await _bot_admin_rights(bot, chat.id)
+    if not ok:
+        return err
+
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat.id, creates_join_request=(channel_type == "join_request")
+        )
+        invite_link = invite.invite_link
+    except Exception as e:
+        return f"❌ Havola yaratilmadi: {e}"
+
+    display = _channel_display(chat)
+    await models.add_channel(chat.id, display, invite_link, channel_type)
+
+    if channel_type == "join_request":
+        return (
+            f"✅ Zayafka kanal ulandi: {display}\n"
+            f"🔗 So'rov havolasi: {invite_link}\n\n"
+            "ℹ️ Foydalanuvchi shu havola orqali 'so'rov' yuborgani bilanoq "
+            "botdan foydalana oladi. So'rovlarni kanal ichida ko'rib chiqing."
+        )
+    return f"✅ Kanal ulandi: {display}\n🔗 {invite_link}"
+
+
+def _pending_channels_kb(pending: list[dict], prefix: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"➕ {_truncate(ch['title'])}", callback_data=f"{prefix}:{ch['chat_id']}")]
+        for ch in pending
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _safe_edit_text(call: CallbackQuery, text: str, reply_markup=None):
+    """edit_text that silently ignores Telegram's 'message is not modified'."""
+    try:
+        await call.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -65,7 +230,6 @@ class AdminStates(StatesGroup):
     # Channel management
     waiting_add_channel        = State()
     waiting_add_zayafka_channel = State()
-    waiting_remove_channel     = State()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -517,40 +681,83 @@ async def section_channels(message: Message, state: FSMContext):
     )
 
 
+@router.my_chat_member()
+async def on_bot_chat_member_update(update: ChatMemberUpdated):
+    """
+    Fired whenever the bot's own membership status changes in a chat.
+
+    When an admin adds the bot to a channel/supergroup and promotes it
+    to admin, cache that chat under the admin's user_id so it shows up
+    as a one-tap button in "Kanal ulash" / "Zayafka kanal ulash". This
+    is the only reliable way to onboard PRIVATE channels, since the Bot
+    API can't resolve private invite links or @usernames for chats the
+    bot doesn't already belong to.
+    """
+    if update.chat.type not in ("channel", "supergroup"):
+        return
+    if update.new_chat_member.status != "administrator":
+        return
+    actor = update.from_user
+    if not actor or not await is_admin(actor.id):
+        return
+    await cache.cache_add_pending_channel(
+        actor.id, update.chat.id, update.chat.title or str(update.chat.id), update.chat.username,
+    )
+
+
 @router.message(F.text == "🔷 Kanal ulash")
 async def ask_add_channel(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
     await state.set_state(AdminStates.waiting_add_channel)
+
+    pending = await cache.cache_get_pending_channels(message.from_user.id)
+    if pending:
+        await message.answer(
+            "🆕 Bot admin qilib qo'shilgan kanal(lar) topildi.\n"
+            "Majburiy a'zolik ro'yxatiga qo'shish uchun tanlang:",
+            reply_markup=_pending_channels_kb(pending, "addch"),
+        )
+
     await message.answer(
-        "Kanal @username sini yuboring (masalan: @mykino_channel)\n"
-        "Yoki kanal ID sini yuboring (masalan: -1001234567890)\n\n"
-        "⚠️ Bot kanalda admin bo'lishi shart!",
+        "🔷 <b>Kanal ulash</b> — ochiq kanal\n\n"
+        "1️⃣ Botni kanalga <b>admin</b> qilib qo'shing\n"
+        "   (kanal yuqorida tugma sifatida chiqadi)\n"
+        "2️⃣ Yoki kanaldagi postni shu yerga forward qiling\n"
+        "3️⃣ Yoki kanal @username yoki havolasini yuboring\n\n"
+        "⚠️ Bot kanalda admin bo'lishi va 'Foydalanuvchilarni taklif "
+        "qilish' huquqiga ega bo'lishi shart!",
         reply_markup=kb_cancel(),
     )
 
 
 @router.message(AdminStates.waiting_add_channel)
 async def do_add_channel(message: Message, state: FSMContext, bot: Bot):
-    if not message.text:
-        await message.answer("❌ Iltimos, @username yoki ID yuboring.")
-        return
-    raw = message.text.strip()
-    # Accept either @username string or a numeric ID
-    chat_ref = raw if raw.startswith("@") else _parse_channel_input(raw)
-    if chat_ref is None:
-        await message.answer("❌ Noto'g'ri format. @username yoki raqamli ID yuboring.")
+    chat, err = await _resolve_target_chat(message, bot)
+    if err:
+        await message.answer(err)
         return
 
-    try:
-        chat = await bot.get_chat(chat_ref)
-        invite = chat.invite_link or await bot.export_chat_invite_link(chat.id)
-        display = f"@{chat.username}" if chat.username else chat.title
-        await models.add_channel(chat.id, display, invite, "standard")
+    result = await _finalize_add_channel(bot, chat.id, "standard")
+    if result.startswith("✅"):
+        await cache.cache_remove_pending_channel(message.from_user.id, chat.id)
         await state.clear()
-        await message.answer(f"✅ Kanal ulandi: {display}", reply_markup=kb_channels())
-    except Exception as e:
-        await message.answer(f"❌ Xato: {e}")
+        await message.answer(result, reply_markup=kb_channels())
+    else:
+        await message.answer(result)
+
+
+@router.callback_query(F.data.startswith("addch:"))
+async def cb_add_pending_channel(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await is_admin(call.from_user.id):
+        return
+    chat_id = int(call.data.split(":", 1)[1])
+    result = await _finalize_add_channel(bot, chat_id, "standard")
+    if result.startswith("✅"):
+        await cache.cache_remove_pending_channel(call.from_user.id, chat_id)
+        await state.clear()
+    await _safe_edit_text(call, result, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+    await call.answer()
 
 
 @router.message(F.text == "📌 Zayafka kanal ulash")
@@ -558,75 +765,108 @@ async def ask_add_zayafka(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
     await state.set_state(AdminStates.waiting_add_zayafka_channel)
+
+    pending = await cache.cache_get_pending_channels(message.from_user.id)
+    if pending:
+        await message.answer(
+            "🆕 Bot admin qilib qo'shilgan kanal(lar) topildi.\n"
+            "So'rov asosida ulash uchun tanlang:",
+            reply_markup=_pending_channels_kb(pending, "zch"),
+        )
+
     await message.answer(
-        "Join-request kanal @username sini yuboring (masalan: @mykino_channel)\n"
-        "Yoki kanal ID sini yuboring (masalan: -1001234567890)",
+        "📌 <b>Zayafka kanal ulash</b> — so'rov asosida (yopiq kanal)\n\n"
+        "Bu turdagi kanalga a'zolik so'rov orqali tasdiqlanadi. "
+        "Foydalanuvchi 'So'rov yuborish' tugmasini bosgani bilanoq "
+        "botdan foydalana oladi — so'rovlarni keyin o'zingiz kanal "
+        "ichida ko'rib chiqasiz.\n\n"
+        "1️⃣ Botni yopiq kanalga <b>admin</b> qilib qo'shing\n"
+        "   (kanal yuqorida tugma sifatida chiqadi)\n"
+        "2️⃣ Yoki kanaldagi postni shu yerga forward qiling\n\n"
+        "⚠️ Botga 'Foydalanuvchilarni taklif qilish' huquqini bering — "
+        "shu orqali so'rov havolasi avtomatik yaratiladi.",
         reply_markup=kb_cancel(),
     )
 
 
 @router.message(AdminStates.waiting_add_zayafka_channel)
 async def do_add_zayafka(message: Message, state: FSMContext, bot: Bot):
-    if not message.text:
-        await message.answer("❌ Iltimos, @username yoki ID yuboring.")
+    chat, err = await _resolve_target_chat(message, bot)
+    if err:
+        await message.answer(err)
         return
-    raw = message.text.strip()
-    chat_ref = raw if raw.startswith("@") else _parse_channel_input(raw)
-    if chat_ref is None:
-        await message.answer("❌ Noto'g'ri format. @username yoki raqamli ID yuboring.")
-        return
-    try:
-        chat = await bot.get_chat(chat_ref)
-        invite = chat.invite_link or await bot.export_chat_invite_link(chat.id)
-        display = f"@{chat.username}" if chat.username else chat.title
-        await models.add_channel(chat.id, display, invite, "join_request")
+
+    result = await _finalize_add_channel(bot, chat.id, "join_request")
+    if result.startswith("✅"):
+        await cache.cache_remove_pending_channel(message.from_user.id, chat.id)
         await state.clear()
-        await message.answer(f"✅ Zayafka kanal ulandi: {display}", reply_markup=kb_channels())
-    except Exception as e:
-        await message.answer(f"❌ Xato: {e}")
+        await message.answer(result, reply_markup=kb_channels())
+    else:
+        await message.answer(result)
+
+
+@router.callback_query(F.data.startswith("zch:"))
+async def cb_add_pending_zayafka(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await is_admin(call.from_user.id):
+        return
+    chat_id = int(call.data.split(":", 1)[1])
+    result = await _finalize_add_channel(bot, chat_id, "join_request")
+    if result.startswith("✅"):
+        await cache.cache_remove_pending_channel(call.from_user.id, chat_id)
+        await state.clear()
+    await _safe_edit_text(call, result, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+    await call.answer()
+
+
+def _build_removal_view(channels: list) -> tuple[str, InlineKeyboardMarkup]:
+    if not channels:
+        return "Hozircha ulangan kanal yo'q.", InlineKeyboardMarkup(inline_keyboard=[])
+
+    lines = ["🔶 <b>Ulangan kanallar</b>", "", "Uzish uchun kerakli kanalni bosing:"]
+    buttons = []
+    for i, ch in enumerate(channels, start=1):
+        icon = "📌" if ch["channel_type"] == "join_request" else "🔷"
+        name = ch["channel_username"] or str(ch["channel_id"])
+        lines.append(f"{i}. {icon} {name}")
+        buttons.append(
+            [InlineKeyboardButton(text=f"❌ {i}. {_truncate(name, 30)}", callback_data=f"rmch:{ch['channel_id']}")]
+        )
+
+    buttons.append([InlineKeyboardButton(text="✅ Yakunlash", callback_data="rmch_done")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @router.message(F.text == "🔶 Kanal uzish")
 async def ask_remove_channel(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
-    # Show which channels are currently linked so admin can pick easily
-    channels = await models.get_all_channels()
-    if channels:
-        ch_list = "\n".join(f"• {ch['channel_username']} ({ch['channel_id']})" for ch in channels)
-        hint = f"Ulangan kanallar:\n{ch_list}\n\n"
-    else:
-        hint = "Hozircha ulangan kanal yo'q.\n\n"
-    await state.set_state(AdminStates.waiting_remove_channel)
-    await message.answer(
-        hint + "Uzmoqchi bo'lgan kanal @username yoki ID sini yuboring:",
-        reply_markup=kb_cancel(),
-    )
-
-
-@router.message(AdminStates.waiting_remove_channel)
-async def do_remove_channel(message: Message, state: FSMContext, bot: Bot):
-    if not message.text:
-        await message.answer("❌ Iltimos, @username yoki ID yuboring.")
-        return
-    raw = message.text.strip()
-    if raw.startswith("@"):
-        # Resolve username → numeric ID
-        try:
-            chat = await bot.get_chat(raw)
-            cid = chat.id
-        except Exception as e:
-            await message.answer(f"❌ Kanal topilmadi: {e}")
-            return
-    else:
-        cid = _parse_channel_input(raw)
-        if cid is None:
-            await message.answer("❌ Noto'g'ri format.")
-            return
-    removed = await models.remove_channel(cid)
     await state.clear()
-    status = f"✅ {raw} kanal uzildi." if removed else f"⚠️ {raw} topilmadi."
-    await message.answer(status, reply_markup=kb_channels())
+    channels = await models.get_all_channels()
+    text, kb = _build_removal_view(channels)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rmch:"))
+async def cb_remove_channel(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return
+    channel_id = int(call.data.split(":", 1)[1])
+    removed = await models.remove_channel(channel_id)
+
+    channels = await models.get_all_channels()
+    text, kb = _build_removal_view(channels)
+    if removed:
+        text = "✅ Kanal uzildi.\n\n" + text
+    await _safe_edit_text(call, text, reply_markup=kb)
+    await call.answer("✅ Uzildi" if removed else "⚠️ Topilmadi")
+
+
+@router.callback_query(F.data == "rmch_done")
+async def cb_remove_channel_done(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        return
+    await _safe_edit_text(call, "✅ Yakunlandi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+    await call.answer()
 
 
 @router.message(F.text == "🟩 Majburiy a'zolik")
@@ -755,8 +995,12 @@ async def show_guide(message: Message):
         "📘 <b>Qo'llanma</b>\n\n"
         "1️⃣ Kino qo'shish: <b>📦 Ma'lumotlar bo'limi → 🎬 Kino qo'shish</b>\n"
         "   Avval kino kodini, keyin videoni yuboring.\n\n"
-        "2️⃣ Force-sub: <b>💬 Kanallar → 🔷 Kanal ulash</b>\n"
-        "   Bot kanalda admin bo'lishi shart!\n\n"
+        "2️⃣ Force-sub: <b>💬 Kanallar → 🔷 Kanal ulash</b> (ochiq) yoki "
+        "<b>📌 Zayafka kanal ulash</b> (yopiq/so'rovli)\n"
+        "   Botni kanalga admin qiling — kanal avtomatik tugma sifatida "
+        "chiqadi, tugmani bosing.\n"
+        "   🔶 Kanal uzish orqali ulangan kanallarni tugma bilan o'chirib "
+        "tashlash mumkin.\n\n"
         "3️⃣ Broadcast: <b>👤 Userlar → ✍️ Post xabar</b>\n"
         "   Xabar fonida yuboriladi, bot bloklanmaydi.\n\n"
         "4️⃣ Telegram file_id tizimi:\n"
