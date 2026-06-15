@@ -3,6 +3,7 @@
 # ============================================================
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -178,15 +179,16 @@ async def _finalize_add_channel(bot: Bot, chat_id: int, channel_type: str) -> st
 
     display = _channel_display(chat)
     await models.add_channel(chat.id, display, invite_link, channel_type)
+    safe_display = html.escape(display)
 
     if channel_type == "join_request":
         return (
-            f"✅ Zayafka kanal ulandi: {display}\n"
+            f"✅ Zayafka kanal ulandi: {safe_display}\n"
             f"🔗 So'rov havolasi: {invite_link}\n\n"
             "ℹ️ Foydalanuvchi shu havola orqali 'so'rov' yuborgani bilanoq "
             "botdan foydalana oladi. So'rovlarni kanal ichida ko'rib chiqing."
         )
-    return f"✅ Kanal ulandi: {display}\n🔗 {invite_link}"
+    return f"✅ Kanal ulandi: {safe_display}\n🔗 {invite_link}"
 
 
 def _pending_channels_kb(pending: list[dict], prefix: str) -> InlineKeyboardMarkup:
@@ -682,16 +684,17 @@ async def section_channels(message: Message, state: FSMContext):
 
 
 @router.my_chat_member()
-async def on_bot_chat_member_update(update: ChatMemberUpdated):
+async def on_bot_chat_member_update(update: ChatMemberUpdated, bot: Bot):
     """
     Fired whenever the bot's own membership status changes in a chat.
 
     When an admin adds the bot to a channel/supergroup and promotes it
-    to admin, cache that chat under the admin's user_id so it shows up
-    as a one-tap button in "Kanal ulash" / "Zayafka kanal ulash". This
-    is the only reliable way to onboard PRIVATE channels, since the Bot
-    API can't resolve private invite links or @usernames for chats the
-    bot doesn't already belong to.
+    to admin, cache that chat under the admin's user_id AND immediately
+    message them with one-tap buttons to wire it up — as a standard or
+    a zayafka (join-request) force-sub channel. This is the only
+    reliable way to onboard PRIVATE channels, since the Bot API can't
+    resolve private invite links or @usernames for chats the bot
+    doesn't already belong to.
     """
     if update.chat.type not in ("channel", "supergroup"):
         return
@@ -700,9 +703,27 @@ async def on_bot_chat_member_update(update: ChatMemberUpdated):
     actor = update.from_user
     if not actor or not await is_admin(actor.id):
         return
+
     await cache.cache_add_pending_channel(
         actor.id, update.chat.id, update.chat.title or str(update.chat.id), update.chat.username,
     )
+
+    display = html.escape(update.chat.title or str(update.chat.id))
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔷 Ochiq kanal sifatida ulash", callback_data=f"addch:{update.chat.id}")],
+            [InlineKeyboardButton(text="📌 Zayafka (so'rov) kanal sifatida ulash", callback_data=f"zch:{update.chat.id}")],
+        ]
+    )
+    try:
+        await bot.send_message(
+            actor.id,
+            f"✅ Bot <b>{display}</b> kanaliga admin qilib qo'shildi.\n\n"
+            "Majburiy a'zolik ro'yxatiga qaysi turda ulaymiz?",
+            reply_markup=kb,
+        )
+    except Exception:
+        log.warning("Could not notify admin %s about new channel %s", actor.id, update.chat.id)
 
 
 @router.message(F.text == "🔷 Kanal ulash")
@@ -756,7 +777,10 @@ async def cb_add_pending_channel(call: CallbackQuery, state: FSMContext, bot: Bo
     if result.startswith("✅"):
         await cache.cache_remove_pending_channel(call.from_user.id, chat_id)
         await state.clear()
-    await _safe_edit_text(call, result, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+        await _safe_edit_text(call, result, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+    else:
+        # Keep the original buttons so the admin can fix permissions and retry.
+        await _safe_edit_text(call, result, reply_markup=call.message.reply_markup)
     await call.answer()
 
 
@@ -814,7 +838,10 @@ async def cb_add_pending_zayafka(call: CallbackQuery, state: FSMContext, bot: Bo
     if result.startswith("✅"):
         await cache.cache_remove_pending_channel(call.from_user.id, chat_id)
         await state.clear()
-    await _safe_edit_text(call, result, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+        await _safe_edit_text(call, result, reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+    else:
+        # Keep the original buttons so the admin can fix permissions and retry.
+        await _safe_edit_text(call, result, reply_markup=call.message.reply_markup)
     await call.answer()
 
 
@@ -827,7 +854,7 @@ def _build_removal_view(channels: list) -> tuple[str, InlineKeyboardMarkup]:
     for i, ch in enumerate(channels, start=1):
         icon = "📌" if ch["channel_type"] == "join_request" else "🔷"
         name = ch["channel_username"] or str(ch["channel_id"])
-        lines.append(f"{i}. {icon} {name}")
+        lines.append(f"{i}. {icon} {html.escape(name)}")
         buttons.append(
             [InlineKeyboardButton(text=f"❌ {i}. {_truncate(name, 30)}", callback_data=f"rmch:{ch['channel_id']}")]
         )
